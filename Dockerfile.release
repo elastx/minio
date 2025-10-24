@@ -1,6 +1,6 @@
 FROM golang:1.24-alpine AS build
 
-ENV TARGETARCH=linux-amd64
+ENV TARGETARCH=amd64
 ENV GOPATH=/go
 ENV CGO_ENABLED=0
 
