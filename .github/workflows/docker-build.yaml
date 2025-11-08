@@ -2,8 +2,8 @@ name: docker-build
 on:
   pull_request: {}
   push:
-    branches:
-      - "elx-vault-main"
+#    branches:
+#      - "elx-vault-main"
     tags:
       - ELX.*
 
