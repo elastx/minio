@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - "elx-vault-main"
+    tags:
+      - ELX.*
 
 env:
   IMAGE_NAME: elx-vault
