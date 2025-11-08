@@ -1,11 +1,14 @@
 name: docker-build
 on:
   pull_request: {}
-  push:
-#    branches:
-#      - "elx-vault-main"
+  create:
     tags:
-      - ELX.*
+      - "**"
+  push:
+    branches:
+      - "elx-vault-main"
+    tags:
+      - "**"
 
 env:
   IMAGE_NAME: elx-vault
