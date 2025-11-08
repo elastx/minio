@@ -20,7 +20,7 @@ RUN apk add -U --no-cache ca-certificates && \
 #    curl -s -q https://dl.min.io/server/minio/release/linux-${TARGETARCH}/archive/minio.${RELEASE}.sha256sum -o /go/bin/minio.sha256sum && \
 #    chmod +x /go/bin/minio
 
-RUN go install github.com/minio/minio@latest
+RUN go install github.com/minio/minio@RELEASE.2025-10-15T17-29-55Z
 RUN chmod +x /go/bin/minio
 
 # Download mc binary and signature files
