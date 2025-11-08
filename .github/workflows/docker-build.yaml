@@ -5,7 +5,7 @@ on:
 #    branches:
 #      - "elx-vault-main"
     tags:
-      - ELX.*
+      - ELX*
 
 env:
   IMAGE_NAME: elx-vault
