@@ -158,12 +158,21 @@ func TestExtractMetadataHeaders(t *testing.T) {
 			metadata:   nil,
 			shouldFail: true,
 		},
+		// CVE-2026-34204: X-Minio-Replication-* SSE headers must not be
+		// accepted from regular (non-replication) requests.
+		{
+			header: http.Header{
+				"X-Minio-Replication-Server-Side-Encryption-Sealed-Key": []string{"injected-value"},
+			},
+			metadata:   map[string]string{},
+			shouldFail: false,
+		},
 	}
 
 	// Validate if the extracting headers.
 	for i, testCase := range testCases {
 		metadata := make(map[string]string)
-		err := extractMetadataFromMime(t.Context(), textproto.MIMEHeader(testCase.header), metadata)
+		err := extractMetadataFromMime(t.Context(), textproto.MIMEHeader(testCase.header), metadata, false)
 		if err != nil && !testCase.shouldFail {
 			t.Fatalf("Test %d failed to extract metadata: %v", i+1, err)
 		}
@@ -173,6 +182,24 @@ func TestExtractMetadataHeaders(t *testing.T) {
 		if err == nil && !reflect.DeepEqual(metadata, testCase.metadata) {
 			t.Fatalf("Test %d failed: Expected \"%#v\", got \"%#v\"", i+1, testCase.metadata, metadata)
 		}
+	}
+}
+
+// Tests that replication SSE headers are accepted when explicitly allowed.
+func TestExtractMetadataHeadersReplicationAllowed(t *testing.T) {
+	metadata := make(map[string]string)
+	header := http.Header{
+		"X-Minio-Replication-Server-Side-Encryption-Sealed-Key": []string{"replica-value"},
+	}
+	err := extractMetadataFromMime(t.Context(), textproto.MIMEHeader(header), metadata, true)
+	if err != nil {
+		t.Fatalf("failed to extract metadata: %v", err)
+	}
+	expected := map[string]string{
+		"X-Minio-Internal-Server-Side-Encryption-Sealed-Key": "replica-value",
+	}
+	if !reflect.DeepEqual(metadata, expected) {
+		t.Fatalf("Expected %#v, got %#v", expected, metadata)
 	}
 }
 

@@ -731,7 +731,11 @@ func isPutActionAllowed(ctx context.Context, atype authType, bucketName, objectN
 	case authTypeStreamingSigned, authTypePresigned, authTypeSigned, authTypeStreamingSignedTrailer:
 		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
 	case authTypeStreamingUnsignedTrailer:
-		cred, owner, s3Err = getReqAccessKeyV4(r, region, serviceS3)
+		// For unsigned trailer streaming the request must either be fully
+		// signed (credentials come from the Authorization header) or be
+		// anonymous. Query-string X-Amz-Credential is not signature-verified
+		// for this auth type and must not be used for authorization.
+		cred, owner, s3Err = getReqAccessKeyV4FromHeader(r, region, serviceS3)
 		if s3Err == ErrMissingFields {
 			// Could be anonymous. cred + owner is zero value.
 			s3Err = ErrNone
