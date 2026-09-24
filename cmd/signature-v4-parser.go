@@ -66,6 +66,23 @@ func getReqAccessKeyV4(r *http.Request, region string, stype serviceType) (auth.
 	return checkKeyValid(r, ch.accessKey)
 }
 
+// getReqAccessKeyV4FromHeader extracts the access key only from the
+// Authorization header. It is used for auth types (such as unsigned trailer
+// streaming) where query-string credentials must not be trusted because no
+// signature verification is performed for them.
+func getReqAccessKeyV4FromHeader(r *http.Request, region string, stype serviceType) (auth.Credentials, bool, APIErrorCode) {
+	v4Auth := strings.TrimPrefix(r.Header.Get("Authorization"), signV4Algorithm)
+	authFields := strings.Split(strings.TrimSpace(v4Auth), ",")
+	if len(authFields) != 3 {
+		return auth.Credentials{}, false, ErrMissingFields
+	}
+	ch, s3Err := parseCredentialHeader(authFields[0], region, stype)
+	if s3Err != ErrNone {
+		return auth.Credentials{}, false, s3Err
+	}
+	return checkKeyValid(r, ch.accessKey)
+}
+
 // parse credentialHeader string into its structured form.
 func parseCredentialHeader(credElement string, region string, stype serviceType) (ch credentialHeader, aec APIErrorCode) {
 	creds := strings.SplitN(strings.TrimSpace(credElement), "=", 2)

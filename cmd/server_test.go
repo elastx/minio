@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/xml"
@@ -128,6 +129,8 @@ func runAllTests(suite *TestSuiteCommon, c *check) {
 	suite.TestBucketSQSNotificationWebHook(c)
 	suite.TestBucketSQSNotificationAMQP(c)
 	suite.TestUnsignedCVE(c)
+	suite.TestUnsignedTrailerQueryStringCVE(c)
+	suite.TestSnowballAutoExtractCVE(c)
 	suite.TearDownSuite(c)
 }
 
@@ -407,6 +410,117 @@ func (s *TestSuiteCommon) TestUnsignedCVE(c *check) {
 
 	// assert the http response status code.
 	c.Assert(response.StatusCode, http.StatusBadRequest)
+}
+
+func (s *TestSuiteCommon) TestUnsignedTrailerQueryStringCVE(c *check) {
+	c.Helper()
+
+	// generate a random bucket Name.
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	// execute the request.
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	now := UTCNow()
+	scope := fmt.Sprintf("%s/us-east-1/s3/aws4_request", now.Format(yyyymmdd))
+	putURL := getPutObjectURL(s.endPoint, bucketName, "test-cve-object.txt")
+	// Inject a valid access key via query string, mimicking the
+	// CVE-2026-41145 attack vector.
+	putURL = putURL + "?" + xhttp.AmzCredential + "=" + url.QueryEscape(s.accessKey+"/"+scope)
+
+	req, err := http.NewRequest(http.MethodPut, putURL, nil)
+	c.Assert(err, nil)
+
+	req.Body = io.NopCloser(bytes.NewReader([]byte("foobar!\n")))
+	req.Trailer = http.Header{}
+	req.Trailer.Set("x-amz-checksum-crc32", "rK0DXg==")
+
+	req = signer.StreamingUnsignedV4(req, "", 8, now)
+
+	// Remove the Authorization header; the attacker only provides the
+	// access key via the query string and does not know the secret key.
+	req.Header.Del("Authorization")
+
+	// Ensure the headers expected for unsigned trailer streaming remain.
+	req.Header.Set("X-Amz-Decoded-Content-Length", "8")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	req.Header.Set("x-amz-content-sha256", unsignedPayloadTrailer)
+
+	// execute the request.
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	// The request must be rejected because query-string credentials are not
+	// signature-verified for unsigned trailer streaming.
+	c.Assert(response.StatusCode, http.StatusForbidden)
+}
+
+func (s *TestSuiteCommon) TestSnowballAutoExtractCVE(c *check) {
+	c.Helper()
+
+	// generate a random bucket Name.
+	bucketName := getRandomBucketName()
+
+	// HTTP request to create the bucket.
+	request, err := newTestSignedRequest(http.MethodPut, getMakeBucketURL(s.endPoint, bucketName),
+		0, nil, s.accessKey, s.secretKey, s.signer)
+	c.Assert(err, nil)
+
+	// execute the request.
+	response, err := s.client.Do(request)
+	c.Assert(err, nil)
+	c.Assert(response.StatusCode, http.StatusOK)
+
+	// Build a minimal valid tar archive.
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	c.Assert(tw.WriteHeader(&tar.Header{
+		Name: "test.txt",
+		Mode: 0644,
+		Size: int64(len("hello snowball")),
+	}), nil)
+	_, err = tw.Write([]byte("hello snowball"))
+	c.Assert(err, nil)
+	c.Assert(tw.Close(), nil)
+
+	now := UTCNow()
+	req, err := http.NewRequest(http.MethodPut, getPutObjectURL(s.endPoint, bucketName, "test-snowball.tar"), nil)
+	c.Assert(err, nil)
+
+	req.Body = io.NopCloser(bytes.NewReader(tarBuf.Bytes()))
+	req.Trailer = http.Header{}
+	req.Trailer.Set("x-amz-checksum-crc32", "rK0DXg==")
+
+	req = signer.StreamingUnsignedV4(req, "", int64(tarBuf.Len()), now)
+
+	// The CVE-2026-40344 attack: provide an Authorization header with a
+	// valid access key but a completely fabricated signature. The Snowball
+	// auto-extract handler must still verify the signature.
+	maliciousAuth := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=deadbeefdeadbeefdeadbeeddeadbeeddeadbeefdeadbeefdeadbeefdeadbeef", s.accessKey, now.Format(yyyymmdd))
+	req.Header.Set("Authorization", maliciousAuth)
+
+	// Ensure the headers expected for unsigned trailer streaming remain.
+	req.Header.Set("X-Amz-Decoded-Content-Length", fmt.Sprintf("%d", tarBuf.Len()))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32")
+	req.Header.Set("x-amz-content-sha256", unsignedPayloadTrailer)
+	// Trigger the Snowball auto-extract handler.
+	req.Header.Set("X-Amz-Meta-Snowball-Auto-Extract", "true")
+
+	// execute the request.
+	response, err = s.client.Do(req)
+	c.Assert(err, nil)
+
+	// The request must be rejected because the fabricated signature is not valid.
+	c.Assert(response.StatusCode, http.StatusForbidden)
 }
 
 func (s *TestSuiteCommon) TestBucketSQSNotificationAMQP(c *check) {

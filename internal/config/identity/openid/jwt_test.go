@@ -129,6 +129,9 @@ func TestJWTHMACType(t *testing.T) {
 	provider := providerCfg{
 		ClientID:     "76b95ae5-33ef-4283-97b7-d2a85dc2d8f4",
 		ClientSecret: "WNGvKVyyNmXq0TraSvjaDN9CtpFgx35IXtGEffMCPR0",
+		DiscoveryDoc: DiscoveryDoc{
+			IDTokenSigningAlgValuesSupported: []string{"HS256"},
+		},
 	}
 	provider.JWKS.URL = u1
 	cfg := Config{
@@ -148,6 +151,71 @@ func TestJWTHMACType(t *testing.T) {
 	var claims jwtgo.MapClaims
 	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestJWTAlgorithmConfusion verifies CVE-2026-33322: an attacker with the
+// client secret must not be able to forge an HS256 token when the provider
+// only advertises RS256.
+func TestJWTAlgorithmConfusion(t *testing.T) {
+	server := initJWKSServer()
+	defer server.Close()
+
+	jwt := &jwtgo.Token{
+		Method: jwtgo.SigningMethodHS256,
+		Claims: jwtgo.StandardClaims{
+			ExpiresAt: 253428928061,
+			Audience:  "76b95ae5-33ef-4283-97b7-d2a85dc2d8f4",
+		},
+		Header: map[string]any{
+			"typ": "JWT",
+			"alg": jwtgo.SigningMethodHS256.Alg(),
+			"kid": "76b95ae5-33ef-4283-97b7-d2a85dc2d8f4",
+		},
+	}
+
+	token, err := jwt.SignedString([]byte("WNGvKVyyNmXq0TraSvjaDN9CtpFgx35IXtGEffMCPR0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u1, err := xnet.ParseHTTPURL(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pubKeys := publicKeys{
+		RWMutex: &sync.RWMutex{},
+		pkMap:   map[string]any{},
+	}
+	pubKeys.add("76b95ae5-33ef-4283-97b7-d2a85dc2d8f4", []byte("WNGvKVyyNmXq0TraSvjaDN9CtpFgx35IXtGEffMCPR0"))
+
+	provider := providerCfg{
+		ClientID:     "76b95ae5-33ef-4283-97b7-d2a85dc2d8f4",
+		ClientSecret: "WNGvKVyyNmXq0TraSvjaDN9CtpFgx35IXtGEffMCPR0",
+		DiscoveryDoc: DiscoveryDoc{
+			// Provider only advertises RS256; HS256 must be rejected.
+			IDTokenSigningAlgValuesSupported: []string{"RS256"},
+		},
+	}
+	provider.JWKS.URL = u1
+	cfg := Config{
+		Enabled: true,
+		pubKeys: pubKeys,
+		arnProviderCfgsMap: map[arn.ARN]*providerCfg{
+			DummyRoleARN: &provider,
+		},
+		ProviderCfgs: map[string]*providerCfg{
+			"1": &provider,
+		},
+		closeRespFn: func(rc io.ReadCloser) {
+			rc.Close()
+		},
+	}
+
+	var claims jwtgo.MapClaims
+	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err == nil {
+		t.Fatal("expected HS256 token to be rejected when provider advertises only RS256")
 	}
 }
 

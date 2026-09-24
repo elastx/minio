@@ -29,6 +29,7 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
@@ -142,15 +143,18 @@ var userMetadataKeyPrefixes = []string{
 
 // extractMetadataFromReq extracts metadata from HTTP header and HTTP queryString.
 func extractMetadataFromReq(ctx context.Context, r *http.Request) (metadata map[string]string, err error) {
-	return extractMetadata(ctx, textproto.MIMEHeader(r.Form), textproto.MIMEHeader(r.Header))
+	// CVE-2026-34204: only replication traffic is allowed to set internal SSE
+	// metadata via X-Minio-Replication-* headers.
+	isReplica := r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String()
+	return extractMetadata(ctx, isReplica, textproto.MIMEHeader(r.Form), textproto.MIMEHeader(r.Header))
 }
 
-func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (metadata map[string]string, err error) {
+func extractMetadata(ctx context.Context, isReplica bool, mimesHeader ...textproto.MIMEHeader) (metadata map[string]string, err error) {
 	metadata = make(map[string]string)
 
 	for _, hdr := range mimesHeader {
 		// Extract all query values.
-		err = extractMetadataFromMime(ctx, hdr, metadata)
+		err = extractMetadataFromMime(ctx, hdr, metadata, isReplica)
 		if err != nil {
 			return nil, err
 		}
@@ -191,7 +195,9 @@ func extractMetadata(ctx context.Context, mimesHeader ...textproto.MIMEHeader) (
 }
 
 // extractMetadata extracts metadata from map values.
-func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string) error {
+// When allowReplicationHeaders is false, X-Minio-Replication-* headers that
+// map to internal SSE metadata are ignored (CVE-2026-34204).
+func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[string]string, allowReplicationHeaders bool) error {
 	if v == nil {
 		bugLogIf(ctx, errInvalidArgument)
 		return errInvalidArgument
@@ -208,6 +214,9 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
 		if ok {
 			if v, ok := replicationToInternalHeaders[supportedHeader]; ok {
+				if !allowReplicationHeaders {
+					continue
+				}
 				m[v] = strings.Join(value, ",")
 			} else {
 				m[supportedHeader] = strings.Join(value, ",")

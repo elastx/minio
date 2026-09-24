@@ -1253,8 +1253,10 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 	}
 
 	// Extract metadata to be saved from received Form.
+	// Post-policy uploads are never replication requests, so replication
+	// SSE headers must not be accepted (CVE-2026-34204).
 	metadata := make(map[string]string)
-	err = extractMetadataFromMime(ctx, textproto.MIMEHeader(formValues), metadata)
+	err = extractMetadataFromMime(ctx, textproto.MIMEHeader(formValues), metadata, false)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return

@@ -79,8 +79,14 @@ func (r *Config) PopulatePublicKey(arn arn.ARN) error {
 		return nil
 	}
 
-	// Add client secret for the client ID for HMAC based signature.
-	r.pubKeys.add(pCfg.ClientID, []byte(pCfg.ClientSecret))
+	// Add client secret for the client ID for HMAC based signature, but only
+	// when the provider advertises HMAC signing algorithms. Otherwise an
+	// attacker who knows the client secret could perform an algorithm
+	// confusion attack by sending a token with alg=HS256 even though the
+	// provider only issues RS256 tokens (CVE-2026-33322).
+	if hasHMACAlgorithm(pCfg.DiscoveryDoc.IDTokenSigningAlgValuesSupported) {
+		r.pubKeys.add(pCfg.ClientID, []byte(pCfg.ClientSecret))
+	}
 
 	client := &http.Client{
 		Transport: r.transport,
@@ -102,6 +108,18 @@ func (r *Config) PopulatePublicKey(arn arn.ARN) error {
 var (
 	ErrTokenExpired = errors.New("token expired")
 )
+
+// hasHMACAlgorithm returns true if the provider advertises an HMAC-based
+// JWT signing algorithm.
+func hasHMACAlgorithm(algs []string) bool {
+	for _, alg := range algs {
+		switch alg {
+		case "HS256", "HS384", "HS512":
+			return true
+		}
+	}
+	return false
+}
 
 func updateClaimsExpiry(dsecs string, claims map[string]any) error {
 	expStr := claims["exp"]
@@ -134,13 +152,18 @@ const (
 
 // Validate - validates the id_token.
 func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, dsecs string, claims map[string]any) error {
+	pCfg, ok := r.arnProviderCfgsMap[arn]
+	if !ok {
+		return fmt.Errorf("Role %s does not exist", arn)
+	}
+
 	jp := new(jwtgo.Parser)
-	jp.ValidMethods = []string{
-		"RS256", "RS384", "RS512",
-		"ES256", "ES384", "ES512",
-		"HS256", "HS384", "HS512",
-		"RS3256", "RS3384", "RS3512",
-		"ES3256", "ES3384", "ES3512",
+	// Only accept the signing algorithms advertised by the provider. If the
+	// provider does not advertise any, fall back to asymmetric algorithms to
+	// prevent algorithm confusion attacks (CVE-2026-33322).
+	jp.ValidMethods = pCfg.DiscoveryDoc.IDTokenSigningAlgValuesSupported
+	if len(jp.ValidMethods) == 0 {
+		jp.ValidMethods = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
 	}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (any, error) {
@@ -155,11 +178,6 @@ func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, 
 		return pubkey, nil
 	}
 
-	pCfg, ok := r.arnProviderCfgsMap[arn]
-	if !ok {
-		return fmt.Errorf("Role %s does not exist", arn)
-	}
-
 	mclaims := jwtgo.MapClaims(claims)
 	jwtToken, err := jp.ParseWithClaims(token, &mclaims, keyFuncCallback)
 	if err != nil {
@@ -168,7 +186,7 @@ func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, 
 		if err = r.PopulatePublicKey(arn); err != nil {
 			return err
 		}
-		jwtToken, err = jwtgo.ParseWithClaims(token, &mclaims, keyFuncCallback)
+		jwtToken, err = jp.ParseWithClaims(token, &mclaims, keyFuncCallback)
 		if err != nil {
 			return err
 		}
