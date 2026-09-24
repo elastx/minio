@@ -18,6 +18,7 @@
 package drive
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ const (
 	EnvMaxDriveTimeout       = "MINIO_DRIVE_MAX_TIMEOUT"
 	EnvMaxDriveTimeoutLegacy = "_MINIO_DRIVE_MAX_TIMEOUT"
 	EnvMaxDiskTimeoutLegacy  = "_MINIO_DISK_MAX_TIMEOUT"
+	EnvReadFanoutDelay       = "MINIO_DRIVE_READ_FANOUT_DELAY"
 )
 
 // DefaultKVS - default KVS for drive
@@ -37,6 +39,10 @@ var DefaultKVS = config.KVS{
 	config.KV{
 		Key:   MaxTimeout,
 		Value: "30s",
+	},
+	config.KV{
+		Key:   ReadFanoutDelay,
+		Value: "0",
 	},
 }
 
@@ -46,6 +52,10 @@ var configLk sync.RWMutex
 type Config struct {
 	// MaxTimeout - maximum timeout for a drive operation
 	MaxTimeout time.Duration `json:"maxTimeout"`
+
+	// ReadFanoutDelay - delay after which a hedged erasure read fans out
+	// to all remaining shards, 0 disables hedged reads.
+	ReadFanoutDelay time.Duration `json:"readFanoutDelay"`
 }
 
 // Update - updates the config with latest values
@@ -53,12 +63,21 @@ func (c *Config) Update(updated Config) error {
 	configLk.Lock()
 	defer configLk.Unlock()
 	c.MaxTimeout = getMaxTimeout(updated.MaxTimeout)
+	c.ReadFanoutDelay = updated.ReadFanoutDelay
 	return nil
 }
 
 // GetMaxTimeout - returns the per call drive operation timeout
 func (c *Config) GetMaxTimeout() time.Duration {
 	return c.GetOPTimeout()
+}
+
+// GetReadFanoutDelay - returns the delay after which hedged erasure
+// reads fan out to all remaining shards. 0 disables hedged reads.
+func (c *Config) GetReadFanoutDelay() time.Duration {
+	configLk.RLock()
+	defer configLk.RUnlock()
+	return c.ReadFanoutDelay
 }
 
 // GetOPTimeout - returns the per call drive operation timeout
@@ -90,6 +109,16 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 			cfg.MaxTimeout = getMaxTimeout(dur)
 		}
 	}
+
+	fanoutDelay, err := time.ParseDuration(env.Get(EnvReadFanoutDelay, kvs.GetWithDefault(ReadFanoutDelay, DefaultKVS)))
+	if err != nil {
+		return cfg, err
+	}
+	if fanoutDelay < 0 {
+		return cfg, fmt.Errorf("invalid value %v for read_fanout_delay", fanoutDelay)
+	}
+	cfg.ReadFanoutDelay = fanoutDelay
+
 	return cfg, err
 }
 

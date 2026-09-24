@@ -21,11 +21,17 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"io"
 	"math/rand"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/bpool"
+	"github.com/minio/minio/internal/config/drive"
 )
 
 func (a badDisk) ReadFile(ctx context.Context, volume string, path string, offset int64, buf []byte, verifier *BitrotVerifier) (n int64, err error) {
@@ -84,6 +90,12 @@ var erasureDecodeTests = []struct {
 }
 
 func TestErasureDecode(t *testing.T) {
+	// The streaming bitrot writer draws from the global byte pool
+	// which is otherwise only initialized during server pool setup.
+	if globalBytePoolCap.Load() == nil {
+		globalBytePoolCap.Store(bpool.NewBytePoolCap(64, int(blockSizeV2), 2*int(blockSizeV2)))
+	}
+
 	for i, test := range erasureDecodeTests {
 		setup, err := newErasureTestSetup(t, test.dataBlocks, test.onDisks-test.dataBlocks, test.blocksize)
 		if err != nil {
@@ -200,6 +212,11 @@ func TestErasureDecode(t *testing.T) {
 func TestErasureDecodeRandomOffsetLength(t *testing.T) {
 	if testing.Short() {
 		t.Skip()
+	}
+	// The streaming bitrot writer draws from the global byte pool
+	// which is otherwise only initialized during server pool setup.
+	if globalBytePoolCap.Load() == nil {
+		globalBytePoolCap.Store(bpool.NewBytePoolCap(64, int(blockSizeV2), 2*int(blockSizeV2)))
 	}
 	// Initialize environment needed for the test.
 	dataBlocks := 7
@@ -382,4 +399,407 @@ func BenchmarkErasureDecode_16_40MB(b *testing.B) {
 	b.Run(" 00000000|XXXXXXXX ", func(b *testing.B) { benchmarkErasureDecode(8, 8, 0, 8, size, b) })
 	b.Run(" XXXX0000|XXXX0000 ", func(b *testing.B) { benchmarkErasureDecode(8, 8, 4, 4, size, b) })
 	b.Run(" XXXXXXXX|00000000 ", func(b *testing.B) { benchmarkErasureDecode(8, 8, 8, 0, size, b) })
+}
+
+// gatedReaderAt blocks the first ReadAt call until gate is closed.
+// All later calls pass through. started is closed once the first
+// ReadAt is blocked, done once it has returned.
+type gatedReaderAt struct {
+	inner   io.ReaderAt
+	gate    chan struct{}
+	started chan struct{}
+	done    chan struct{}
+	block   sync.Once
+	calls   atomic.Int32
+}
+
+func (g *gatedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	g.calls.Add(1)
+	g.block.Do(func() {
+		close(g.started)
+		<-g.gate
+		close(g.done)
+	})
+	return g.inner.ReadAt(p, off)
+}
+
+func (g *gatedReaderAt) Close() error {
+	if c, ok := g.inner.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// missingShardReader always fails with errFileNotFound.
+type missingShardReader struct{}
+
+func (missingShardReader) ReadAt([]byte, int64) (int, error) { return 0, errFileNotFound }
+
+// hedgedEncodeShards encodes data block by block and returns the
+// shard files, mimicking the layout produced by Erasure.Encode.
+func hedgedEncodeShards(t *testing.T, e Erasure, data []byte) [][]byte {
+	t.Helper()
+	shards := make([][]byte, e.dataBlocks+e.parityBlocks)
+	for off := 0; off < len(data); off += int(e.blockSize) {
+		chunk := data[off:]
+		if len(chunk) > int(e.blockSize) {
+			chunk = chunk[:int(e.blockSize)]
+		}
+		encoded, err := e.EncodeData(t.Context(), chunk)
+		if err != nil {
+			t.Fatalf("EncodeData failed: %v", err)
+		}
+		for i := range shards {
+			shards[i] = append(shards[i], encoded[i]...)
+		}
+	}
+	return shards
+}
+
+func hedgedDecodeShards(t *testing.T, e Erasure, bufs [][]byte) []byte {
+	t.Helper()
+	if err := e.DecodeDataBlocks(bufs); err != nil {
+		t.Fatalf("DecodeDataBlocks failed: %v", err)
+	}
+	var out []byte
+	for i := 0; i < e.dataBlocks; i++ {
+		out = append(out, bufs[i]...)
+	}
+	return out
+}
+
+func hedgedDeliveredCount(bufs [][]byte) int {
+	n := 0
+	for _, b := range bufs {
+		if len(b) > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func hedgedShardReaders(t *testing.T, shards [][]byte) []io.ReaderAt {
+	t.Helper()
+	readers := make([]io.ReaderAt, len(shards))
+	for i := range shards {
+		readers[i] = bytes.NewReader(shards[i])
+	}
+	return readers
+}
+
+// TestParallelReaderHedgedOneSlow verifies that a single slow shard is
+// covered by the dataBlocks+1 initial launch without waiting for the
+// fan-out delay or the slow disk.
+func TestParallelReaderHedgedOneSlow(t *testing.T) {
+	const dataBlocks = 3
+	e, err := NewErasure(t.Context(), dataBlocks, 2, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 60)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	shards := hedgedEncodeShards(t, e, data)
+	readers := hedgedShardReaders(t, shards)
+
+	gated := &gatedReaderAt{
+		inner:   readers[0],
+		gate:    make(chan struct{}),
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	readers[0] = gated
+
+	const fanoutDelay = 10 * time.Second
+	p := newParallelReader(readers, e, 0, int64(len(data)), fanoutDelay)
+	defer p.Done()
+
+	for block := 0; block < 2; block++ {
+		start := time.Now()
+		bufs, err := p.Read(nil)
+		if err != nil {
+			t.Fatalf("block %d: Read failed: %v", block, err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("block %d: Read blocked for %v, hedged read should not wait for the slow shard", block, elapsed)
+		}
+		if got := hedgedDeliveredCount(bufs); got != dataBlocks {
+			t.Fatalf("block %d: got %d delivered shards, want %d", block, got, dataBlocks)
+		}
+		if got := hedgedDecodeShards(t, e, bufs); !bytes.Equal(got, data[block*30:(block+1)*30]) {
+			t.Fatalf("block %d: decoded data mismatch", block)
+		}
+	}
+
+	// The slow reader was launched once per block, the never-needed
+	// 5th shard was never launched since the hedge sufficed.
+	if got := gated.calls.Load(); got != 1 {
+		t.Fatalf("gated reader launched %d times, want 1", got)
+	}
+
+	p.Done()
+	p.stateLK.Lock()
+	if readers[0] != nil {
+		t.Fatal("straggler reader should be marked nil in orgReaders after Done()")
+	}
+	p.stateLK.Unlock()
+
+	close(gated.gate)
+	<-gated.done
+}
+
+// TestParallelReaderHedgedFanout verifies that the fan-out timer
+// launches the remaining shards after fanoutDelay when two shards
+// are slow.
+func TestParallelReaderHedgedFanout(t *testing.T) {
+	const dataBlocks = 3
+	e, err := NewErasure(t.Context(), dataBlocks, 2, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 30)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	shards := hedgedEncodeShards(t, e, data)
+	readers := hedgedShardReaders(t, shards)
+
+	gated0 := &gatedReaderAt{inner: readers[0], gate: make(chan struct{}), started: make(chan struct{}), done: make(chan struct{})}
+	gated1 := &gatedReaderAt{inner: readers[1], gate: make(chan struct{}), started: make(chan struct{}), done: make(chan struct{})}
+	readers[0] = gated0
+	readers[1] = gated1
+
+	const fanoutDelay = 300 * time.Millisecond
+	p := newParallelReader(readers, e, 0, int64(len(data)), fanoutDelay)
+	defer p.Done()
+
+	start := time.Now()
+	bufs, err := p.Read(nil)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Fatalf("Read returned after %v, fan-out delay did not trigger", elapsed)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Read returned after %v, too slow", elapsed)
+	}
+	if got := hedgedDeliveredCount(bufs); got != dataBlocks {
+		t.Fatalf("got %d delivered shards, want %d", got, dataBlocks)
+	}
+	if got := hedgedDecodeShards(t, e, bufs); !bytes.Equal(got, data) {
+		t.Fatal("decoded data mismatch")
+	}
+
+	close(gated0.gate)
+	close(gated1.gate)
+}
+
+// TestParallelReaderHedgedErrorSubstitution verifies that a shard
+// failing immediately is substituted right away, without waiting
+// for the fan-out delay.
+func TestParallelReaderHedgedErrorSubstitution(t *testing.T) {
+	const dataBlocks = 3
+	e, err := NewErasure(t.Context(), dataBlocks, 2, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 30)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	shards := hedgedEncodeShards(t, e, data)
+	readers := hedgedShardReaders(t, shards)
+	readers[0] = missingShardReader{}
+
+	const fanoutDelay = 10 * time.Second
+	p := newParallelReader(readers, e, 0, int64(len(data)), fanoutDelay)
+	defer p.Done()
+
+	start := time.Now()
+	bufs, err := p.Read(nil)
+	if !errors.Is(err, errFileNotFound) {
+		t.Fatalf("expected errFileNotFound heal flag, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Read blocked for %v, substitution should be immediate", elapsed)
+	}
+	if got := hedgedDeliveredCount(bufs); got != dataBlocks {
+		t.Fatalf("got %d delivered shards, want %d", got, dataBlocks)
+	}
+	if got := hedgedDecodeShards(t, e, bufs); !bytes.Equal(got, data) {
+		t.Fatal("decoded data mismatch")
+	}
+}
+
+// TestParallelReaderHedgedQuorum verifies the read quorum error when
+// too many shards fail.
+func TestParallelReaderHedgedQuorum(t *testing.T) {
+	const dataBlocks = 3
+	e, err := NewErasure(t.Context(), dataBlocks, 2, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 30)
+	shards := hedgedEncodeShards(t, e, data)
+	readers := hedgedShardReaders(t, shards)
+	readers[0] = missingShardReader{}
+	readers[1] = missingShardReader{}
+	readers[2] = missingShardReader{}
+
+	p := newParallelReader(readers, e, 0, int64(len(data)), 10*time.Second)
+	defer p.Done()
+
+	bufs, err := p.Read(nil)
+	if !errors.Is(err, errErasureReadQuorum) {
+		t.Fatalf("expected errErasureReadQuorum, got %v", err)
+	}
+	if bufs != nil {
+		t.Fatal("expected nil bufs on quorum error")
+	}
+}
+
+// TestParallelReaderHedgedRejoin verifies that a straggler that
+// completes after its block returned rejoins for the next block.
+func TestParallelReaderHedgedRejoin(t *testing.T) {
+	const dataBlocks = 3
+	e, err := NewErasure(t.Context(), dataBlocks, 2, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 60)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	shards := hedgedEncodeShards(t, e, data)
+	readers := hedgedShardReaders(t, shards)
+
+	gated := &gatedReaderAt{
+		inner:   readers[0],
+		gate:    make(chan struct{}),
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	readers[0] = gated
+
+	p := newParallelReader(readers, e, 0, int64(len(data)), 10*time.Second)
+	defer p.Done()
+
+	// Block 0: reader 0 straggles, delivered via hedge.
+	bufs, err := p.Read(nil)
+	if err != nil {
+		t.Fatalf("block 0: Read failed: %v", err)
+	}
+	if got := hedgedDecodeShards(t, e, bufs); !bytes.Equal(got, data[0:30]) {
+		t.Fatal("block 0: decoded data mismatch")
+	}
+
+	// Release the straggler and wait until it is available again.
+	close(gated.gate)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		p.stateLK.Lock()
+		inflight := p.inflight[0]
+		p.stateLK.Unlock()
+		if !inflight {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("straggler never completed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Block 1: reader 0 must have rejoined and be launched again.
+	bufs, err = p.Read(nil)
+	if err != nil {
+		t.Fatalf("block 1: Read failed: %v", err)
+	}
+	if got := hedgedDeliveredCount(bufs); got != dataBlocks {
+		t.Fatalf("block 1: got %d delivered shards, want %d", got, dataBlocks)
+	}
+	if got := hedgedDecodeShards(t, e, bufs); !bytes.Equal(got, data[30:60]) {
+		t.Fatal("block 1: decoded data mismatch")
+	}
+	if got := gated.calls.Load(); got != 2 {
+		t.Fatalf("gated reader launched %d times, want 2", got)
+	}
+}
+
+// TestErasureDecodeHedgedSlowDisk verifies the full decode path with
+// hedged reads enabled: a disk stuck in a read does not stall the
+// object read.
+func TestErasureDecodeHedgedSlowDisk(t *testing.T) {
+	// The streaming bitrot writer draws from the global byte pool
+	// which is otherwise only initialized during server pool setup.
+	if globalBytePoolCap.Load() == nil {
+		globalBytePoolCap.Store(bpool.NewBytePoolCap(64, int(blockSizeV2), 2*int(blockSizeV2)))
+	}
+
+	dataBlocks := 3
+	parityBlocks := 2
+	setup, err := newErasureTestSetup(t, dataBlocks, parityBlocks, blockSizeV2)
+	if err != nil {
+		t.Fatalf("failed to create test setup: %v", err)
+	}
+	erasure, err := NewErasure(t.Context(), dataBlocks, parityBlocks, blockSizeV2)
+	if err != nil {
+		t.Fatalf("failed to create ErasureStorage: %v", err)
+	}
+
+	data := make([]byte, oneMiByte)
+	if _, err = io.ReadFull(crand.Reader, data); err != nil {
+		t.Fatal(err)
+	}
+
+	buffer := make([]byte, blockSizeV2, 2*blockSizeV2)
+	writers := make([]io.Writer, len(setup.disks))
+	for i, disk := range setup.disks {
+		writers[i] = newBitrotWriter(disk, "", "testbucket", "object", erasure.ShardFileSize(int64(len(data))), DefaultBitrotAlgorithm, erasure.ShardSize())
+	}
+	if _, err = erasure.Encode(t.Context(), bytes.NewReader(data), writers, buffer, erasure.dataBlocks+1); err != nil {
+		t.Fatal(err)
+	}
+	closeBitrotWriters(writers)
+
+	bitrotReaders := make([]io.ReaderAt, len(setup.disks))
+	for index, disk := range setup.disks {
+		tillOffset := erasure.ShardFileOffset(0, int64(len(data)), int64(len(data)))
+		bitrotReaders[index] = newBitrotReader(disk, nil, "testbucket", "object", tillOffset, DefaultBitrotAlgorithm, bitrotWriterSum(writers[index]), erasure.ShardSize())
+	}
+	gated := &gatedReaderAt{
+		inner:   bitrotReaders[0],
+		gate:    make(chan struct{}),
+		started: make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	bitrotReaders[0] = gated
+
+	globalDriveConfig.Update(drive.Config{ReadFanoutDelay: 10 * time.Second})
+	defer globalDriveConfig.Update(drive.Config{})
+
+	writer := bytes.NewBuffer(nil)
+	start := time.Now()
+	_, err = erasure.Decode(t.Context(), writer, bitrotReaders, 0, int64(len(data)), int64(len(data)), nil)
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("Decode blocked for %v, slow disk should not stall the read", elapsed)
+	}
+	if !bytes.Equal(writer.Bytes(), data) {
+		t.Fatal("read returns wrong file content")
+	}
+
+	// The straggler is marked in the caller's reader slice so that
+	// closeBitrotReaders skips it; its goroutine closes it after the
+	// read returns.
+	if bitrotReaders[0] != nil {
+		t.Fatal("straggler reader should be marked nil for the caller")
+	}
+
+	close(gated.gate)
+	<-gated.done
+	closeBitrotReaders(bitrotReaders)
 }

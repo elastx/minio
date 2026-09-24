@@ -23,12 +23,21 @@ var (
 	// MaxTimeout is the max timeout for drive
 	MaxTimeout = "max_timeout"
 
+	// ReadFanoutDelay is the delay before hedged erasure reads fan out to all shards
+	ReadFanoutDelay = "read_fanout_delay"
+
 	// HelpDrive is help for drive
 	HelpDrive = config.HelpKVS{
 		config.HelpKV{
 			Key:         MaxTimeout,
 			Type:        "string",
 			Description: "set per call max_timeout for the drive, defaults to 30 seconds",
+			Optional:    true,
+		},
+		config.HelpKV{
+			Key:         ReadFanoutDelay,
+			Type:        "string",
+			Description: "hedged erasure read fan-out delay, e.g. '250ms'. Reads start with K+1 shards and fan out to all shards after this delay. '0' (default) disables hedged reads",
 			Optional:    true,
 		},
 	}
